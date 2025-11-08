@@ -220,8 +220,243 @@ bindingSet->addItem(BindingSetItem::ConstantBuffer(0, buffer));
    - Must match shader structure layout (use `layout(std140)` or similar)
 
 2. **Two types of constant buffers:**
-   - **Volatile** - Updated frequently (per-frame). NVRHI handles versioning.
-   - **Static** - Created once, rarely updated.
+
+   **Static Constant Buffers** - Immutable or rarely updated:
+   ```cpp
+   bufferDesc.isConstantBuffer = true;
+   bufferDesc.isVolatile = false;  // Default
+   nvrhi::BufferHandle staticCB = device->createBuffer(bufferDesc);
+
+   // Update infrequently (causes GPU stall if GPU is using it)
+   commandList->writeBuffer(staticCB, &data, sizeof(data));
+   ```
+   - Used for data that rarely changes (light properties, material constants)
+   - Updating while GPU is reading will stall (synchronization point)
+   - Single GPU-side allocation
+
+   **Volatile Constant Buffers** - Updated frequently (per-frame/per-draw):
+   ```cpp
+   bufferDesc.isConstantBuffer = true;
+   bufferDesc.isVolatile = true;  // Key flag!
+   nvrhi::BufferHandle volatileCB = device->createBuffer(bufferDesc);
+
+   // Update every frame - NO STALLS!
+   for (each frame) {
+       commandList->writeBuffer(volatileCB, &frameData, sizeof(frameData));
+       commandList->draw(...);
+   }
+   ```
+   - Used for per-frame/per-draw data (view/projection matrices, per-object transforms)
+   - **NVRHI handles versioning automatically** - no GPU stalls!
+   - Critical for performance with modern multi-buffered rendering
+
+   **Why Volatile Constant Buffers Exist: The Frames-in-Flight Problem**
+
+   In modern APIs, you typically have multiple frames "in flight" simultaneously:
+   ```
+   Frame N-2: GPU is executing commands
+   Frame N-1: GPU is starting to process commands
+   Frame N:   CPU is recording new commands
+   ```
+
+   **OpenGL (Simple but Inefficient):**
+   ```cpp
+   // OpenGL implicitly handles this
+   glBufferSubData(GL_UNIFORM_BUFFER, 0, size, &newData);
+   // Driver either:
+   // 1. Stalls until GPU finishes reading old data (slow!)
+   // 2. Creates a new backing store automatically (hidden overhead)
+   ```
+
+   **Modern APIs Problem:**
+   ```cpp
+   // BAD: Overwriting buffer GPU is still reading!
+   commandList1->writeBuffer(cb, &frame1Data, size);
+   device->executeCommandList(cmdList1);  // GPU starts reading cb
+
+   commandList2->writeBuffer(cb, &frame2Data, size);  // OVERWRITES frame1Data!
+   device->executeCommandList(cmdList2);  // GPU now sees corrupted data
+   ```
+
+   **Solution 1: Manual Ring Buffering (The Hard Way)**
+   ```cpp
+   // Create N versions manually
+   const int framesInFlight = 3;
+   std::vector<BufferHandle> constantBuffers(framesInFlight);
+
+   for (int i = 0; i < framesInFlight; i++) {
+       constantBuffers[i] = device->createBuffer(cbDesc);
+   }
+
+   int frameIndex = 0;
+   while (rendering) {
+       // Use different buffer each frame
+       auto cb = constantBuffers[frameIndex % framesInFlight];
+       commandList->writeBuffer(cb, &data, size);
+
+       // Need to recreate binding sets!
+       auto bindings = device->createBindingSet(
+           BindingSetDesc().addItem(BindingSetItem::ConstantBuffer(0, cb)),
+           layout);
+
+       frameIndex++;
+   }
+   ```
+   This works but is tedious and error-prone.
+
+   **Solution 2: Volatile Constant Buffers (NVRHI's Solution)**
+   ```cpp
+   // Just mark it volatile
+   bufferDesc.isVolatile = true;
+   auto cb = device->createBuffer(bufferDesc);
+
+   // NVRHI handles versioning internally!
+   while (rendering) {
+       commandList->writeBuffer(cb, &data, size);  // Gets new version
+       commandList->draw(...);  // Uses this version
+       // Previous versions kept alive until GPU finishes
+   }
+   ```
+
+   **How NVRHI Implements Volatile Constant Buffers (Backend Details):**
+
+   **DirectX 11:**
+   ```cpp
+   // Uses D3D11_USAGE_DYNAMIC buffers
+   // D3D11 driver handles versioning automatically
+   D3D11_BUFFER_DESC desc;
+   desc.Usage = D3D11_USAGE_DYNAMIC;
+   desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+   ```
+
+   **DirectX 12:**
+   ```cpp
+   // NVRHI allocates from internal upload buffer ring
+   // Each writeBuffer() gets a fresh allocation
+   // Bound as root CBVs (constant buffer views)
+
+   // Conceptually:
+   struct UploadBufferChunk {
+       void* cpuAddress;
+       uint64_t gpuAddress;
+       uint64_t size;
+   };
+
+   // On writeBuffer():
+   auto chunk = uploadRingBuffer.allocate(size);
+   memcpy(chunk.cpuAddress, data, size);
+
+   // At draw time, bind via root descriptor:
+   commandList->SetGraphicsRootConstantBufferView(
+       rootParamIndex, chunk.gpuAddress);
+   ```
+   - Sub-allocated from large upload heap
+   - Linear allocator advances each frame
+   - Old allocations freed when GPU finishes frame
+
+   **Vulkan:**
+   ```cpp
+   // NVRHI creates multi-versioned VkBuffer
+   // Uses dynamic offsets at bind time
+
+   // Creation:
+   VkBufferCreateInfo bufferInfo;
+   bufferInfo.size = constantBufferSize * maxVersions;
+   bufferInfo.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+
+   VkMemoryPropertyFlags memProps =
+       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+
+   // At draw time:
+   uint32_t dynamicOffset = currentVersion * constantBufferSize;
+   vkCmdBindDescriptorSets(
+       commandBuffer,
+       VK_PIPELINE_BIND_POINT_GRAPHICS,
+       pipelineLayout,
+       firstSet, descriptorSetCount, descriptorSets,
+       1, &dynamicOffset);  // Different offset per frame!
+   ```
+
+   **When to Use Volatile vs Static:**
+
+   | Use Case | Buffer Type | Example |
+   |----------|-------------|---------|
+   | Per-frame global data | Volatile | View matrix, projection matrix, time |
+   | Per-draw object data | Volatile | Model matrix, object color, material ID |
+   | Per-instance data | Volatile | Instance transforms in instanced rendering |
+   | Scene constants | Static | Light positions, light colors |
+   | Material properties | Static | Roughness, metallic, texture indices |
+   | Config/settings | Static | Shadow map resolution, quality settings |
+
+   **Practical Example: Complete Volatile CB Usage**
+   ```cpp
+   // Setup (once)
+   struct PerFrameConstants {
+       float4x4 viewMatrix;
+       float4x4 projectionMatrix;
+       float4 cameraPosition;
+       float time;
+   };
+
+   nvrhi::BufferDesc cbDesc;
+   cbDesc.byteSize = sizeof(PerFrameConstants);
+   cbDesc.isConstantBuffer = true;
+   cbDesc.isVolatile = true;  // Updated every frame
+   cbDesc.debugName = "Per-Frame Constants";
+   auto perFrameCB = device->createBuffer(cbDesc);
+
+   // Create binding set ONCE (buffer handle doesn't change)
+   auto bindingSet = device->createBindingSet(
+       BindingSetDesc()
+           .addItem(BindingSetItem::ConstantBuffer(0, perFrameCB)),
+       bindingLayout);
+
+   // Render loop
+   while (rendering) {
+       commandList->open();
+
+       // Update with this frame's data
+       PerFrameConstants constants;
+       constants.viewMatrix = camera.getViewMatrix();
+       constants.projectionMatrix = camera.getProjectionMatrix();
+       constants.cameraPosition = camera.getPosition();
+       constants.time = getTime();
+
+       // Write gets new version internally - no stall!
+       commandList->writeBuffer(perFrameCB, &constants, sizeof(constants));
+
+       // Use the same binding set - NVRHI tracks the right version
+       GraphicsState state;
+       state.bindings = { bindingSet };
+       commandList->setGraphicsState(state);
+       commandList->draw(...);
+
+       commandList->close();
+       device->executeCommandList(commandList);
+   }
+   ```
+
+   **Key Advantages of NVRHI's Volatile Constant Buffers:**
+   1. **No manual versioning** - NVRHI handles it transparently
+   2. **No GPU stalls** - Always writing to fresh memory
+   3. **Binding sets don't change** - Same handle, different internal version
+   4. **Backend-optimized** - Uses best strategy per API (dynamic buffers, root CBVs, dynamic offsets)
+   5. **Automatic cleanup** - Old versions freed when GPU finishes
+   6. **Simple API** - Just `writeBuffer()` and go!
+
+   **Common Mistake to Avoid:**
+   ```cpp
+   // BAD: Trying to read back from volatile CB
+   bufferDesc.isVolatile = true;
+   auto cb = device->createBuffer(bufferDesc);
+
+   // This will fail or return stale data!
+   commandList->writeBuffer(cb, &data, size);
+   // cb->map() // Not supported for volatile buffers
+
+   // GOOD: Use separate staging buffer for readback
+   ```
 
 3. **Size limits:**
    - Typical CB max: 64KB (much larger than GL_MAX_UNIFORM_BLOCK_SIZE)
