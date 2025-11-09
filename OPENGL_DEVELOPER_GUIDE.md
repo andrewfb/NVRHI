@@ -31,6 +31,147 @@ NVRHI sits in the middle: it gives you modern API benefits (explicit state, PSOs
 
 ## Core Concept Mapping
 
+### API Terminology Reference: OpenGL vs DX12 vs Vulkan vs NVRHI
+
+**Important:** NVRHI strongly favors DirectX 12 naming conventions over Vulkan. This makes the API more approachable since DX12 terminology is generally simpler and more intuitive than Vulkan's verbose naming.
+
+Here's a comprehensive comparison to help you navigate the different APIs:
+
+#### Resource Types and Views
+
+| Concept | OpenGL | DirectX 12 | Vulkan | NVRHI | Notes |
+|---------|--------|------------|--------|-------|-------|
+| **Read-only texture/buffer in shader** | `sampler2D`, `samplerBuffer` | **SRV** (Shader Resource View) | `VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE`, `VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER` | **SRV** | NVRHI uses DX term |
+| **Read-write texture/buffer in shader** | `image2D`, `imageBuffer` (bindless) | **UAV** (Unordered Access View) | `VK_DESCRIPTOR_TYPE_STORAGE_IMAGE`, `VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER` | **UAV** | NVRHI uses DX term |
+| **Uniform/Constant buffer** | `uniform` block (UBO) | **Constant Buffer** (CBV) | **Uniform Buffer** | **Constant Buffer** | NVRHI uses DX term |
+| **Render target** | `GL_COLOR_ATTACHMENT0` | **RTV** (Render Target View) | `VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT` | `isRenderTarget` flag | NVRHI uses flag, not separate view |
+| **Depth/stencil target** | `GL_DEPTH_ATTACHMENT` | **DSV** (Depth Stencil View) | `VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT` | `isRenderTarget` flag | Same as color RT in NVRHI |
+| **Structured buffer (read-only)** | SSBO (readonly) | Structured Buffer (SRV) | Storage Buffer (readonly) | `StructuredBuffer_SRV` | - |
+| **Structured buffer (read-write)** | SSBO | RWStructuredBuffer (UAV) | Storage Buffer | `StructuredBuffer_UAV` | - |
+| **Raw/Byte buffer** | SSBO | ByteAddressBuffer | Storage Buffer | `RawBuffer_SRV/UAV` | - |
+
+#### Command Recording
+
+| Concept | OpenGL | DirectX 12 | Vulkan | NVRHI | Notes |
+|---------|--------|------------|--------|-------|-------|
+| **Command recording object** | Immediate (no object) | **CommandList** | **CommandBuffer** | **CommandList** | NVRHI uses DX term |
+| **Command recording pool** | N/A | CommandAllocator | **CommandPool** | Hidden internally | - |
+| **Start recording** | N/A | `Reset()` | `vkBeginCommandBuffer()` | `open()` | NVRHI uses simpler name |
+| **End recording** | N/A | `Close()` | `vkEndCommandBuffer()` | `close()` | NVRHI matches DX |
+| **Execute commands** | Immediate | `ExecuteCommandLists()` | `vkQueueSubmit()` | `executeCommandList()` | - |
+
+#### Pipeline and State
+
+| Concept | OpenGL | DirectX 12 | Vulkan | NVRHI | Notes |
+|---------|--------|------------|--------|-------|-------|
+| **Pipeline object** | `glUseProgram()` + state | **Pipeline State Object** (PSO) | **Pipeline** | **GraphicsPipeline** | All use PSO concept |
+| **Shader stages** | Vertex/Fragment | VS/HS/DS/GS/**PS** | Vertex/Fragment | VS/HS/DS/GS/**PS** | NVRHI uses **PS** (Pixel Shader), not FS |
+| **Resource binding declaration** | Implicit from shader | **Root Signature** | **Pipeline Layout** + Descriptor Set Layouts | **BindingLayout** | Neutral, but closer to Vulkan concept |
+| **Resource binding instance** | `glBindTexture()`, `glBindBuffer()` | Descriptor Heap + Tables | **Descriptor Set** | **BindingSet** | Closer to Vulkan, but simpler naming |
+| **Vertex input format** | `glVertexAttribPointer()` | **Input Layout** | Vertex Input State | **InputLayout** | NVRHI uses DX term |
+| **Primitive topology** | `GL_TRIANGLES`, etc. | `D3D_PRIMITIVE_TOPOLOGY` | `VK_PRIMITIVE_TOPOLOGY` | `PrimitiveType::TriangleList` | All similar |
+
+#### Synchronization and State
+
+| Concept | OpenGL | DirectX 12 | Vulkan | NVRHI | Notes |
+|---------|--------|------------|--------|-------|-------|
+| **Resource state** | Implicit | **Resource States** (enum) | Image Layout + Access Flags | **ResourceStates** (enum) | NVRHI uses DX model (simpler!) |
+| **State transition** | `glMemoryBarrier()` | Resource **Barrier** | Pipeline **Barrier** + Image Layout Transition | `setTextureState()` / **Barrier** | NVRHI can be automatic or manual |
+| **Examples of states** | N/A | `COMMON`, `RENDER_TARGET`, `SHADER_RESOURCE` | `UNDEFINED`, `COLOR_ATTACHMENT_OPTIMAL`, `SHADER_READ_ONLY_OPTIMAL` | `Common`, `RenderTarget`, `ShaderResource` | NVRHI matches DX states |
+| **Fence/Event** | `glFenceSync()` | **Fence** | **Fence** | `EventQuery` | NVRHI uses unique name |
+
+#### Memory and Resources
+
+| Concept | OpenGL | DirectX 12 | Vulkan | NVRHI | Notes |
+|---------|--------|------------|--------|-------|-------|
+| **Memory allocation** | Implicit | **Heap** | **Device Memory** | **Heap** | NVRHI uses DX term |
+| **Memory type** | N/A | `D3D12_HEAP_TYPE_DEFAULT/UPLOAD/READBACK` | `VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT`, etc. | `MemoryDomain::DeviceLocal/Upload/Readback` | Neutral naming |
+| **Placed resource** | N/A | Placed Resource | `vkBindImageMemory()` | `createTexture()` with heap param | - |
+| **Upload buffer** | `glBufferSubData()` | Upload Heap + manual copy | Staging Buffer + `vkCmdCopyBuffer()` | `writeBuffer()` (automatic) | NVRHI hides complexity |
+
+#### Framebuffer and Render Pass
+
+| Concept | OpenGL | DirectX 12 | Vulkan | NVRHI | Notes |
+|---------|--------|------------|--------|-------|-------|
+| **Framebuffer object** | **FBO** | No explicit object (just bind RTVs) | **Framebuffer** + **RenderPass** | **Framebuffer** | NVRHI uses Vulkan naming but DX simplicity |
+| **Render pass** | N/A | No explicit object | **RenderPass** (complex) | No explicit object | NVRHI follows DX model (simpler) |
+| **Clear value** | `glClear()` | `ClearRenderTargetView()` | Render Pass Clear Value | `clearTextureFloat()` / `useClearValue` flag | - |
+
+#### Queries and Debugging
+
+| Concept | OpenGL | DirectX 12 | Vulkan | NVRHI | Notes |
+|---------|--------|------------|--------|-------|-------|
+| **Timer query** | `GL_TIME_ELAPSED` | Timestamp Query | Timestamp Query | **TimerQuery** | - |
+| **Occlusion query** | `GL_SAMPLES_PASSED` | Occlusion Query | Occlusion Query | Not directly exposed | - |
+| **Debug marker** | `glPushDebugGroup()` | `BeginEvent()` / PIX markers | `vkCmdBeginDebugUtilsLabel()` | `beginMarker()` / `endMarker()` | - |
+| **Object naming** | `glObjectLabel()` | `SetName()` | `vkSetDebugUtilsObjectNameEXT()` | `debugName` field in desc | NVRHI uses descriptor field |
+
+#### Special Features
+
+| Concept | OpenGL | DirectX 12 | Vulkan | NVRHI | Notes |
+|---------|--------|------------|--------|-------|-------|
+| **Bindless resources** | `ARB_bindless_texture` | Descriptor Heap (always bindless) | Update After Bind | **DescriptorTable** | NVRHI has explicit support |
+| **Push constants** | N/A | Root Constants | **Push Constants** | **Push Constants** | NVRHI uses Vulkan term |
+| **Ray tracing AS** | N/A | Acceleration Structure (**AS**) | Acceleration Structure | `rt::AccelStruct` | Neutral |
+| **Indirect draw** | `glDrawIndirect()` | `ExecuteIndirect()` | `vkCmdDrawIndirect()` | `drawIndirect()` | All similar |
+| **Conservative raster** | Extension | `D3D12_CONSERVATIVE_RASTERIZATION_MODE` | `VK_CONSERVATIVE_RASTERIZATION_MODE_EXT` | `RasterState::conservativeRasterEnable` | - |
+
+#### Shader Compilation
+
+| Concept | OpenGL | DirectX 12 | Vulkan | NVRHI | Notes |
+|---------|--------|------------|--------|-------|-------|
+| **Shader language** | **GLSL** | **HLSL** | **GLSL** or HLSL | **HLSL** (for DX12), **GLSL** (for Vulkan) | Backend-dependent |
+| **Bytecode format** | SPIR-V (optional) | **DXIL** | **SPIR-V** | **DXIL** or **SPIR-V** | Backend-dependent |
+| **Runtime compilation** | `glCompileShader()` | `D3DCompile()` | `vkCreateShaderModule()` with SPIR-V | Load pre-compiled bytecode | NVRHI expects pre-compiled |
+| **Shader reflection** | `glGetActiveUniform()` | `ID3D12ShaderReflection` | SPIR-V Cross | Not exposed (use DXC/SPIRV-Cross separately) | - |
+
+### Key Observations
+
+1. **NVRHI is ~70% DX12 naming:**
+   - Uses DX terms: SRV, UAV, CommandList, Constant Buffer, Pixel Shader, Heap, Barrier, Resource States
+   - Uses Vulkan concepts: BindingLayout/BindingSet (descriptor sets), Push Constants
+   - Uses neutral terms: Device, Pipeline, Framebuffer
+
+2. **Why DX12 bias?**
+   - DX12 terms are shorter and more intuitive (SRV vs `VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER`)
+   - NVIDIA works closely with Microsoft on DX12
+   - DX12's resource state model is cleaner than Vulkan's layout + access mask system
+   - Easier for developers to learn
+
+3. **Vulkan influences:**
+   - Binding model (layouts + sets) is closer to Vulkan descriptor sets than DX12 root signatures
+   - Push constants use Vulkan terminology
+   - Framebuffer concept exists (though simplified compared to RenderPass)
+
+4. **Simplifications:**
+   - No explicit render passes (unlike Vulkan)
+   - Resource states are simpler than Vulkan's layout + access + stage model
+   - Automatic state tracking available (neither DX12 nor Vulkan have this)
+   - No manual descriptor heap management (DX12 pain point)
+   - No manual command allocator management (DX12 pain point)
+
+### Quick Translation Guide
+
+**If you know OpenGL:**
+- Think DX12 terms: SRV, UAV, Constant Buffer, Pixel Shader
+- Learn resource states (NVRHI can track automatically)
+- Understand PSOs and binding sets
+
+**If you know DX12:**
+- Most NVRHI maps 1:1 to DX12 concepts
+- Binding model is different (uses sets, not root signature tables)
+- State tracking can be automatic (huge win!)
+- No manual descriptor heap management needed
+
+**If you know Vulkan:**
+- Resource states are simpler (no separate layouts + access flags)
+- SRV/UAV instead of descriptor type enums
+- No explicit render passes
+- Binding sets work like descriptor sets (familiar!)
+- Much less boilerplate
+
+---
+
 ### 1. The Device: From Global Context to Device Object
 
 **OpenGL:**
